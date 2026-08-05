@@ -27,9 +27,34 @@ model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
 print("bft_Arab" in tokenizer.additional_special_tokens if hasattr(tokenizer, "additional_special_tokens") else "check needed")
 
 # %%
+import torch
+
+new_lang_code = "bft_Arab"
+tokenizer.add_special_tokens({"additional_special_tokens": [new_lang_code]})
+model.resize_token_embeddings(len(tokenizer))
+
+# Warm-start the new token's embedding from a linguistically related, known code
+related_code_id = tokenizer.convert_tokens_to_ids("bod_Tibt")
+new_code_id = tokenizer.convert_tokens_to_ids(new_lang_code)
+
+with torch.no_grad():
+    model.get_input_embeddings().weight[new_code_id] = model.get_input_embeddings().weight[related_code_id].clone()
+
+tokenizer.src_lang = "bft_Arab"
+tokenizer.tgt_lang = "eng_Latn"
+
+# Sanity check — confirm the new token actually registered and got a distinct id
+print(f"bft_Arab token id: {new_code_id}")
+print(f"bod_Tibt token id: {related_code_id}")
+print(f"Vocab size after resize: {len(tokenizer)}")
+# %%
 def prepare_batch(example):
-    # Adjust field names once cell 2's actual output confirms them (likely "eng" / "bft_Arab" or similar)
-    inputs = tokenizer(example["bft_Arab"], text_target=example["eng"], return_tensors=None, truncation=True, max_length=128)
+    inputs = tokenizer(
+        example["src_text"],
+        text_target=example["tgt_text"],
+        truncation=True,
+        max_length=128,
+    )
     return inputs
 
 tokenized = ds.map(prepare_batch, remove_columns=ds["dev"].column_names)
@@ -57,7 +82,7 @@ training_args = Seq2SeqTrainingArguments(
     gradient_accumulation_steps=4,
     learning_rate=3e-5,
     warmup_steps=20,
-    max_steps=300,          # small dataset — deliberately modest step count, watch for overfitting early
+    max_steps=800,           # small dataset — deliberately modest step count, watch for overfitting early
     gradient_checkpointing=True,
     fp16=True,
     eval_strategy="steps",
@@ -85,7 +110,8 @@ trainer = Seq2SeqTrainer(
 )
 
 # %%
-trainer.train()
+trainer.train(resume_from_checkpoint=True)
+
 
 # %%
 trainer.push_to_hub()
