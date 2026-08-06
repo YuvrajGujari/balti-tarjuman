@@ -14,7 +14,22 @@ login(token=os.environ["HF_TOKEN"])
 from datasets import load_dataset, Audio
 
 ds = load_dataset("YuvrajGujari/balti-tarjuman-data")
-print(ds)
+ds = ds.cast_column("audio", Audio(decode=False))
+
+# %%
+import soundfile as sf
+import io
+
+def is_readable(example):
+    try:
+        sf.read(io.BytesIO(example["audio"]["bytes"]), frames=1)
+        return True
+    except Exception:
+        return False
+
+print("Checking for corrupted audio files...")
+ds = ds.filter(is_readable, num_proc=4)
+print({split: len(ds[split]) for split in ds})
 
 # %%
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
@@ -24,14 +39,60 @@ processor = WhisperProcessor.from_pretrained(model_name)
 model = WhisperForConditionalGeneration.from_pretrained(model_name)
 
 # %%
-def prepare_batch(batch):
-    audio = batch["audio"]
-    batch["input_features"] = processor.feature_extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
-    batch["labels"] = processor.tokenizer(batch["text"]).input_ids
-    return batch
+import time
 
-ds = ds.map(prepare_batch, remove_columns=ds["train"].column_names, num_proc=1)
+sample = ds["train"][0]
+print("Got sample, bytes length:", len(sample["audio"]["bytes"]))
 
+start = time.time()
+audio_array, sr = sf.read(io.BytesIO(sample["audio"]["bytes"]))
+print(f"sf.read took {time.time()-start:.2f}s, shape={audio_array.shape}, sr={sr}")
+
+if sr != 16000:
+    import librosa
+    start = time.time()
+    audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=16000)
+    sr = 16000
+    print(f"resample took {time.time()-start:.2f}s")
+
+start = time.time()
+features = processor.feature_extractor(audio_array, sampling_rate=sr).input_features[0]
+print(f"feature_extractor took {time.time()-start:.2f}s")
+
+start = time.time()
+labels = processor.tokenizer(sample["text"]).input_ids
+print(f"tokenizer took {time.time()-start:.2f}s")
+
+# %%
+import time
+
+def make_generator(split_ds, split_name):
+    def gen():
+        total = len(split_ds)
+        start_time = time.time()
+        for idx in range(total):
+            example = split_ds[idx]
+            audio_array, sr = sf.read(io.BytesIO(example["audio"]["bytes"]))
+            if sr != 16000:
+                import librosa
+                audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=16000)
+                sr = 16000
+            input_features = processor.feature_extractor(audio_array, sampling_rate=sr).input_features[0]
+            labels = processor.tokenizer(example["text"]).input_ids
+            if idx % 50 == 0:
+                elapsed = time.time() - start_time
+                print(f"[{split_name}] {idx}/{total} done, {elapsed:.1f}s elapsed", flush=True)
+            yield {"input_features": input_features, "labels": labels}
+    return gen
+
+# %%
+from datasets import Dataset
+
+train_dataset = Dataset.from_generator(make_generator(ds["train"], "train"))
+validation_dataset = Dataset.from_generator(make_generator(ds["validation"], "validation"))
+
+print(train_dataset)
+print(validation_dataset)
 # %%
 import torch
 from dataclasses import dataclass
@@ -96,8 +157,8 @@ training_args = Seq2SeqTrainingArguments(
 trainer = Seq2SeqTrainer(
     args=training_args,
     model=model,
-    train_dataset=ds["train"],
-    eval_dataset=ds["validation"],
+    train_dataset=train_dataset,
+    eval_dataset=validation_dataset,
     data_collator=data_collator,
     compute_metrics=compute_metrics,
     processing_class=processor,
