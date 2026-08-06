@@ -16,12 +16,15 @@ Zero-shot `whisper-small` on Balti audio: complete failure, as expected for a la
 - **MT dataset:** resolved after real investigation — NLLB-200 has zero native Balti (`bft`) coverage; found `facebook/bouquet`'s `bft_Arab` config (correct script, English-paired, curated) — small (504 dev + 854 test = 1,358 pairs) but usable and honest to report as-is
 - Prior published work exists: "BaltiVoice" paper (arXiv 2606.03504), 26.74% WER Whisper-small ASR — our differentiator is the **full pipeline** (ASR+MT+TTS), not ASR alone
 
-## Voice 🔄 (in progress)
-Fine-tuning primary ASR (Whisper-small) on the Balti dataset.
+## Voice ✅
+Fine-tuned primary ASR (Whisper-small) on the Balti dataset.
 - Manual feature-extraction/tokenization pipeline built (`process_split`), corrupted-audio filtering added (`soundfile` readability check)
 - Hit and fixed: processed data never wired into the Trainer — `Seq2SeqTrainer` was still pointed at the raw, unprocessed dataset instead of the processed one
 - Hit and fixed: kernel OOM crash converting the full processed dataset to a `Dataset` via `from_list` (~8k examples × full `input_features` arrays exceeded RAM) — switched to `Dataset.from_generator` to stream to disk instead of materializing in memory
-- Training run not yet completed
+- Clean training curve, no overfitting: WER dropped 63.42% → 36.73% over 1000 steps; best checkpoint at step 900 (val loss 0.304, WER 36.73%)
+- Pushed to `YuvrajGujari/whisper-small-balti`; local checkpoint-900 weights cross-checked against the pushed weights via the Hugging Face webpage (model card WER display initially looked like it reflected step 1000, not the best checkpoint — verification done to confirm which weights actually shipped)
+- Gap vs. published BaltiVoice benchmark (26.74% WER on a similar corpus) noted for the writeup — worth investigating rather than treating current result as ceiling
+- Code changes (Trainer wiring fix, OOM fix) committed and pushed to GitHub
 
 ## Echo (not started)
 Fine-tune backup ASR (wav2vec2-XLS-R-300M).
