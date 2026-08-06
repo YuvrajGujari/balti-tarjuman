@@ -8,3 +8,7 @@ wav2vec2-*/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+whisper-small-balti/
+/tmp/hub_check/
+*.safetensors
+.env
