@@ -1,51 +1,293 @@
-# Balti Tarjuman — Hurdles Log
+# Balti Tarjuman – Engineering Case Study
 
-## 1. HF cache PermissionError (initial diagnosis — later revised)
-**Symptom:** `PermissionError` on `.cache/huggingface`, files created with `----------` permissions regardless of umask.
-**Initial theory:** The `/teamspace/studios/this_studio` mount is a custom "lightning" filesystem type that creates new files with zero permissions.
-**Fix attempted:** Set `HF_HOME` / `HF_HUB_CACHE` / `HF_DATASETS_CACHE` to `/home/zeus/...` instead of the `/teamspace` mount, as the very first cell before any HF library import (env vars are locked in at import time by `huggingface_hub`/`datasets`).
-**Caveat:** This fix requires a full kernel restart plus correct cell ordering — setting the env vars *after* an earlier `login()` or model-load cell doesn't work, even in the same session.
+> *Building an end-to-end Balti → English speech translation system for one of the world's lowest-resource languages.*
 
-## 2. Same PermissionError recurs across `/teamspace`, `/home/zeus`, AND `/tmp`
-**Revised diagnosis:** Not a filesystem/mount issue at all. HF's rate-limit-interrupted downloads leave stale `.incomplete` files (hash-named per URL) with broken permissions. Retries hit the same filename and inherit the broken state.
-**Fix:** `find <cache_dir> -name "*.incomplete" -delete` before every retry, and/or switch from `datasets.load_dataset` to `huggingface_hub.snapshot_download` for flat-file, many-item datasets (better resume handling).
+---
 
-## 3. HTTP 429 rate limiting on 9,481-file flat-file dataset download
-**Symptom:** `datasets.load_dataset` downloading 9,481 individual mp3 files (no bundled archive) triggers repeated `429 Too Many Requests`.
-**Fix:** Not a code bug — let the library's backoff retry naturally, with `num_proc=1`. Patience required; can take a long time for this many files.
+# Introduction
 
-## 4. `ValueError: audio ... doesn't have metadata` — folder-based builder crash
-**Symptom:** `datasets`' `audiofolder` builder crashed because an audio file (`common_voice_bft_41845763.mp3`) had no matching row in the downloaded `metadata.csv`.
-**Root cause:** Ambiguous — either a truncated/corrupted `metadata.csv` download (no `.incomplete` marker to catch it, since the file "completed" with bad/partial content), or genuine upstream data noise (audio files without metadata rows).
-**Fix:** Bypassed the strict `audiofolder` matcher entirely. Used `snapshot_download` to pull the raw repo, then did a manual `pandas` inner join between `metadata.csv` and the actual files on disk, dropping unmatched entries instead of crashing. Built the final `Dataset` via `Dataset.from_pandas` + `.cast_column("audio", Audio(...))`.
-**Result:** 9,481 metadata rows, 9,981 mp3s on disk, 500 audio files with no metadata (dropped), 0 metadata rows missing audio → 9,481 clean usable pairs.
+Balti Tarjuman was built to explore the challenges of developing an end-to-end speech translation system for **Balti**, a severely low-resource language with very limited publicly available datasets, pretrained models, and language resources.
 
-## 5. Xet-backend 429s during `snapshot_download`
-**Symptom:** `ConnectionError: 429` specifically on `.../xet-read-token/...` endpoints — a separate rate-limit pool from regular file downloads.
-**Fix:** Set `HF_HUB_DISABLE_XET=1` (before any `huggingface_hub` import, same ordering constraint as #1) to force the classic download path. Combined with a manual retry loop (30 attempts, capped exponential backoff) around `snapshot_download`, using `local_dir` (which resumes cleanly, unlike hash-keyed cache dirs) so partial progress was never lost across retries.
+Unlike high-resource languages where complete solutions already exist, almost every stage of this project required investigation, validation, adaptation, or redesign before it could become part of the final pipeline.
 
-## 6. Leftover split-based code after switching to a flat `Dataset`
-**Symptom:** `AttributeError: 'Dataset' object has no attribute 'keys'`.
-**Root cause:** Inference code was still written for the original `load_dataset` result (which had train/test splits); the new `Dataset.from_pandas` output has no splits, just flat rows.
-**Fix:** Replaced `split_name = list(ds.keys())[0]; sample_ds = ds[split_name]` with `sample_ds = ds` directly.
+This document records the major engineering challenges encountered during development, the decisions taken to overcome them, and the lessons learned throughout the project.
 
-## 7. Zero-shot Whisper-small baseline — expected-bad output (not a bug)
-**Result:** Zero-shot predictions were garbage relative to Balti references (Khmer-, French-, Armenian-, Hebrew-, and Chinese-looking hallucinated text). This is expected — establishes the "before" number ahead of fine-tuning. Cross-checked against a published BaltiVoice paper using the same Common Voice–derived corpus: reported zero-shot baseline ~159% WER, fine-tuned Whisper-small ~26.74% WER — useful ballpark for sanity-checking future numbers.
+---
 
-## 8. Processed training data never wired into the Trainer
-**Symptom:** `ValueError: No columns in the dataset match the model's forward method signature ... The following columns have been ignored: [audio, text]`.
-**Root cause:** `process_split()` built `train_processed` (a plain Python list with `input_features`/`labels`), but `Seq2SeqTrainer` was still pointed at `ds["train"]` — the original raw, unprocessed dataset. The processed data was computed and never used.
-**Fix:** Added the missing `validation_processed` step (only train had been processed), converted both to `Dataset` objects, and pointed the trainer at `train_dataset`/`validation_dataset` instead of `ds["train"]`/`ds["validation"]`.
+# System Overview
 
-## 9. Kernel crash (OOM) building `Dataset.from_list`
-**Symptom:** Kernel crashed silently (no Python traceback) while running `Dataset.from_list(train_processed)`.
-**Root cause:** `train_processed` held ~8,058 full `input_features` arrays (~940KB each at float32) as a Python list in RAM — roughly 7.5GB+ before conversion even started, and `from_list` converts row-by-row, spiking memory further. Instance RAM was exceeded, OS OOM-killed the kernel.
-**Fix:** Switched to `Dataset.from_generator`, which streams examples to Arrow-on-disk incrementally instead of materializing the full list in memory first. Folded the old `process_split` + `from_list` steps into a single generator-based `make_generator()` function. Kernel restart recommended before retry, in case OOM left CUDA context in a bad state.
+The current pipeline consists of the following stages:
 
-## Key transferable lesson
-Any HF `HF_HOME` / `HF_HUB_CACHE` / `HF_DATASETS_CACHE` / `HF_HUB_DISABLE_XET` env var fix **must be set before any import** of `huggingface_hub`, `datasets`, or `transformers` in that kernel session — including indirect imports via `login()` or model loading in earlier cells. A kernel restart plus correct cell ordering is required for the fix to actually take effect.
-Migrating to a different cloud platform mid-project surfaces its own class of setup gaps
-Ran out of compute budget on the original platform and moved the project to Kaggle notebooks. Most things transferred cleanly (code, models/datasets already pushed to the Hub), but platform-specific mechanisms didn't: the secrets-management approach was completely different (a dedicated Secrets panel instead of a local .env file), the working directory didn't behave the way local git clone habits assumed (a file-write command failed because the expected folder didn't exist at the path I assumed), and git identity had to be reconfigured from scratch, same as it had on a prior platform switch. Fix: treated each new environment as needing its own short checklist (secrets, git identity, working directory, package versions) rather than assuming anything carries over.
+```text
+Balti Speech
+      │
+      ▼
+Voice Activity Detection (VAD)
+      │
+      ▼
+Automatic Speech Recognition (ASR)
+      │
+      ▼
+Balti Text
+      │
+      ▼
+Machine Translation (MT)
+      │
+      ▼
+English Text
+      │
+      ▼
+Text-to-Speech (TTS)
+      │
+      ▼
+English Speech
+```
 
-A "1,000+ language" model doesn't necessarily cover the specific language you need
-Found a large pretrained multilingual speech recognition model advertising support for over 1,100 languages — a very promising-looking option for a free, no-fine-tuning backup path. Checked directly rather than assuming: the target language genuinely isn't among the ~1,162 covered, confirmed by inspecting the actual error message listing every supported code. The nearest available fallback language uses a completely different script from the target dataset. Fix: rather than deploy this fallback naively, added an explicit reliability flag — if the fallback ever triggers, the system reports degraded output and stops the pipeline there, instead of feeding low-quality, wrong-script text into a translation model that has never seen anything like it. A working failover for uptime is not the same thing as a trustworthy second opinion, and conflating the two would have been worse than having no failover at all.
+Each stage was developed independently before being integrated into the complete pipeline.
+
+---
+
+# Engineering Challenges
+
+## Challenge 1 — Understanding the Balti AI Ecosystem
+
+### Problem
+
+Before writing any code, I needed to understand what resources already existed for Balti.
+
+Unlike widely supported languages, there was no obvious collection of datasets, pretrained models, benchmarks, or translation systems that could simply be assembled into a working pipeline.
+
+### Approach
+
+I surveyed publicly available datasets, Hugging Face models, multilingual foundation models, and recent publications related to Balti.
+
+This investigation helped identify which parts of the pipeline already had usable resources and which parts would need to be built or adapted.
+
+### Outcome
+
+The project architecture was designed around the resources that actually existed rather than assumptions.
+
+### Lesson Learned
+
+Understanding the ecosystem before implementation prevents costly redesigns later in the project.
+
+---
+
+## Challenge 2 — Finding a Reliable Translation Dataset
+
+### Problem
+
+The first Balti translation model I evaluated appeared promising but failed during validation.
+
+Although its name suggested Balti translation support, it produced text in the wrong script, used the wrong translation direction, and lacked proper language-code infrastructure.
+
+### Approach
+
+Instead of forcing the model into the pipeline, I continued evaluating available resources until I discovered Facebook's **Bouquet** dataset containing the `bft_Arab` configuration.
+
+Unlike previous candidates, it matched the writing system used throughout the project.
+
+### Outcome
+
+The translation stage was rebuilt using a dataset that aligned with the rest of the pipeline.
+
+### Lesson Learned
+
+Model names can be misleading. Every model should be validated before becoming part of a production pipeline.
+
+---
+
+## Challenge 3 — Adapting NLLB for Balti
+
+### Problem
+
+The original translation stage was planned around NLLB-200.
+
+After inspecting the tokenizer configuration directly, I confirmed that Balti was not natively supported.
+
+Without a valid language token, the planned fine-tuning strategy could not work.
+
+### Approach
+
+Instead of abandoning the architecture, I investigated tokenizer internals, language codes, and multilingual datasets.
+
+A new `bft_Arab` language token was introduced and its embedding initialized from the closest available language representation before fine-tuning.
+
+### Outcome
+
+The existing architecture could be preserved while extending the model to support Balti.
+
+### Lesson Learned
+
+Documentation should never replace verification. Inspecting model internals often reveals limitations that are not immediately obvious.
+
+---
+
+## Challenge 4 — Building a Reliable Dataset Download Pipeline
+
+### Problem
+
+Downloading thousands of speech files exposed multiple operational problems including HTTP rate limits, interrupted downloads, stale cache files, and corrupted partial downloads.
+
+These failures made the dataset pipeline unreliable.
+
+### Approach
+
+The download process was redesigned using resumable downloads, retry logic, exponential backoff, cache cleanup, and `snapshot_download`.
+
+The goal shifted from downloading quickly to downloading reliably.
+
+### Outcome
+
+Dataset acquisition became reproducible and resilient against transient network failures.
+
+### Lesson Learned
+
+Reliable data acquisition is just as important as model training.
+
+---
+
+## Challenge 5 — Cleaning the Speech Dataset
+
+### Problem
+
+The downloaded corpus contained inconsistencies between metadata and audio files.
+
+Some recordings had no matching metadata while some metadata entries pointed to missing audio.
+
+### Approach
+
+Rather than relying on strict automated loading, the dataset was rebuilt manually using a verified inner join between metadata and available audio files.
+
+Only valid speech–transcript pairs were retained.
+
+### Outcome
+
+The final training dataset contained only verified samples suitable for model training.
+
+### Lesson Learned
+
+Data quality problems should be solved before training rather than compensated for afterward.
+
+---
+
+## Challenge 6 — Whisper Fine-Tuning
+
+### Problem
+
+The ASR pipeline encountered several engineering issues during preprocessing including dependency conflicts, audio decoding failures, repeated kernel restarts, incorrect dataset wiring, and memory limitations.
+
+### Approach
+
+Instead of continuing to patch individual issues, the preprocessing pipeline was simplified.
+
+Audio decoding was performed directly from embedded bytes, processed datasets were rebuilt correctly, and generator-based dataset creation replaced memory-intensive approaches.
+
+### Outcome
+
+Training became significantly more stable and reproducible.
+
+### Lesson Learned
+
+Simpler pipelines are often more reliable than complex dependency chains.
+
+---
+
+## Challenge 7 — Training a Backup ASR Model
+
+### Problem
+
+Relying entirely on a single speech recognition model introduced unnecessary project risk.
+
+### Approach
+
+A second ASR model based on wav2vec2 was trained in parallel.
+
+The complete processor, tokenizer, and configuration were preserved alongside the model weights to ensure reproducible inference.
+
+### Outcome
+
+The project gained an independent backup ASR path while also enabling architectural comparison.
+
+### Lesson Learned
+
+Building redundancy into critical components makes long-term projects more robust.
+
+---
+
+## Challenge 8 — Platform Migration
+
+### Problem
+
+Cloud compute availability changed during development, requiring the project to move to a different platform before experimentation had finished.
+
+### Approach
+
+The development environment was recreated from scratch, including package installation, authentication, Git configuration, secrets management, and project structure.
+
+The workflow was redesigned to remain portable rather than tied to a single provider.
+
+### Outcome
+
+Development continued with minimal disruption.
+
+### Lesson Learned
+
+Machine learning projects should be portable enough to survive infrastructure changes.
+
+---
+
+## Challenge 9 — Building a Safe End-to-End Pipeline
+
+### Problem
+
+Large multilingual speech models advertised broad language coverage, but direct validation showed that Balti was not always supported.
+
+Passing unsupported predictions into later pipeline stages could silently produce incorrect translations.
+
+### Approach
+
+Instead of allowing uncertain predictions to propagate, explicit validation and fallback handling were introduced so unsupported outputs are detected and reported.
+
+### Outcome
+
+The pipeline now prioritizes reliability over producing misleading results.
+
+### Lesson Learned
+
+A system that clearly reports uncertainty is more trustworthy than one that silently produces incorrect output.
+
+---
+
+# Key Engineering Takeaways
+
+Throughout the project, several principles consistently proved valuable:
+
+* Validate assumptions before building around them.
+* Inspect models instead of relying only on documentation.
+* Treat data quality as a first-class engineering problem.
+* Build systems that can recover from operational failures.
+* Prefer simplifying pipelines over adding more complexity.
+* Design infrastructure that is portable across platforms.
+* Fail safely instead of silently.
+
+---
+
+# Future Improvements
+
+Current areas for future work include:
+
+* Longer Whisper fine-tuning with matched training budgets.
+* Expanded Balti–English parallel data.
+* More comprehensive evaluation across multiple ASR models.
+* Automated experiment tracking.
+* Containerized deployment for reproducibility.
+* Performance optimization for real-time inference.
+
+---
+
+# Closing Thoughts
+
+Balti Tarjuman has been an exercise in far more than model training. Building an end-to-end system for a low-resource language required solving challenges across data engineering, multilingual NLP, speech processing, cloud infrastructure, and system integration.
+
+The most valuable lesson from this project is that successful machine learning systems are built by consistently solving many interconnected engineering problems—not by relying on a single model or algorithm.
