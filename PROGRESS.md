@@ -35,8 +35,14 @@ Fine-tuned `facebook/nllb-200-distilled-600M` on the `bft_Arab` BOUQuET data (50
 - Best checkpoint: step 650, BLEU 4.883 — val loss climbed steadily past step 300 (overfitting, same pattern seen in Whisper Round 2), reported honestly as the real ceiling this data size allows
 - Verified via SHA256, pushed to `YuvrajGujari/nllb-balti-mt`; disk cleaned up (non-best checkpoints removed)
 
-## Assembly (not started)
-Full VAD → ASR (+ fallback) → MT → TTS pipeline, batch mode.
+## Pipeline Assembly (VAD → ASR → MT → TTS) ✅
+- Assembled full end-to-end pipeline: Silero VAD → fine-tuned Whisper-small-balti (primary ASR) → MMS-1b-all (pretrained backup ASR) → fine-tuned NLLB-balti-mt (translation) → Kokoro-82M (TTS)
+- **Backup ASR finding:** confirmed via direct testing that MMS (1,162 supported languages) does not cover Balti (`bft`) at all — falls back to Tibetan (`bod`), which produces wrong-script, low-quality output on real Balti audio. Rather than silently pass this downstream, the pipeline flags fallback output as unreliable and skips translation, returning a clear warning instead of a confidently wrong result.
+- Verified both paths directly:
+  - **Happy path:** real test clip → Whisper transcript closely matched ground truth → NLLB produced coherent English translation → Kokoro produced working audio output
+  - **Failover path:** Whisper forced to fail → MMS fallback correctly triggered → unreliable flag correctly prevented bad output from reaching translation
+- Migrated from Lightning.ai to Kaggle notebooks mid-project after Lightning credits ran low; pipeline built and verified entirely on Kaggle's free GPU tier
+- Code pushed to GitHub as `pipeline.py` (dropped phase numbering going forward — the project stopped mapping cleanly to a fixed phase sequence after the language pivot)
 
 ## Window (not started)
 Demo deployment — Gradio, public link.
