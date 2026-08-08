@@ -1,24 +1,34 @@
-# %%
 import os
-os.environ["HF_HOME"] = "/tmp/hf_home"
-os.environ["HF_HUB_CACHE"] = "/tmp/hf_hub_cache"
-os.environ["HF_DATASETS_CACHE"] = "/tmp/hf_datasets_cache"
-os.environ["HF_HUB_DISABLE_XET"] = "1"
-
-from dotenv import load_dotenv
-load_dotenv()
+import torch
+import time
+import io
+import soundfile as sf
+import evaluate
+from dataclasses import dataclass
+from typing import Any
+from datasets import load_dataset, Audio, Dataset
+from transformers import (
+    WhisperForConditionalGeneration,
+    WhisperProcessor,
+    Seq2SeqTrainingArguments,
+    Seq2SeqTrainer,
+)
+from kaggle_secrets import UserSecretsClient
 from huggingface_hub import login
-login(token=os.environ["HF_TOKEN"])
 
-# %%
-from datasets import load_dataset, Audio
+# Setup environment
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["HF_HOME"] = "/tmp/hf_home"
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Auth
+user_secrets = UserSecretsClient()
+hf_token = user_secrets.get_secret("HF_TOKEN")
+login(token=hf_token)
+
+# Load Dataset
 ds = load_dataset("YuvrajGujari/balti-tarjuman-data")
 ds = ds.cast_column("audio", Audio(decode=False))
-
-# %%
-import soundfile as sf
-import io
 
 def is_readable(example):
     try:
@@ -27,49 +37,25 @@ def is_readable(example):
     except Exception:
         return False
 
-print("Checking for corrupted audio files...")
 ds = ds.filter(is_readable, num_proc=4)
-print({split: len(ds[split]) for split in ds})
 
-# %%
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
-
+# Load Cold-Start Base Model
 model_name = "openai/whisper-small"
 processor = WhisperProcessor.from_pretrained(model_name)
-model = WhisperForConditionalGeneration.from_pretrained(model_name)
+model = WhisperForConditionalGeneration.from_pretrained(model_name).to(device)
 
-# %%
-import time
+model.config.forced_decoder_ids = None
+model.generation_config.forced_decoder_ids = None
 
-sample = ds["train"][0]
-print("Got sample, bytes length:", len(sample["audio"]["bytes"]))
+# SpecAugment setup
+model.config.apply_spec_augment = True
+model.config.mask_time_prob = 0.05
+model.config.mask_feature_prob = 0.05
 
-start = time.time()
-audio_array, sr = sf.read(io.BytesIO(sample["audio"]["bytes"]))
-print(f"sf.read took {time.time()-start:.2f}s, shape={audio_array.shape}, sr={sr}")
-
-if sr != 16000:
-    import librosa
-    start = time.time()
-    audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=16000)
-    sr = 16000
-    print(f"resample took {time.time()-start:.2f}s")
-
-start = time.time()
-features = processor.feature_extractor(audio_array, sampling_rate=sr).input_features[0]
-print(f"feature_extractor took {time.time()-start:.2f}s")
-
-start = time.time()
-labels = processor.tokenizer(sample["text"]).input_ids
-print(f"tokenizer took {time.time()-start:.2f}s")
-
-# %%
-import time
-
+# Generator setup
 def make_generator(split_ds, split_name):
     def gen():
         total = len(split_ds)
-        start_time = time.time()
         for idx in range(total):
             example = split_ds[idx]
             audio_array, sr = sf.read(io.BytesIO(example["audio"]["bytes"]))
@@ -79,25 +65,13 @@ def make_generator(split_ds, split_name):
                 sr = 16000
             input_features = processor.feature_extractor(audio_array, sampling_rate=sr).input_features[0]
             labels = processor.tokenizer(example["text"]).input_ids
-            if idx % 50 == 0:
-                elapsed = time.time() - start_time
-                print(f"[{split_name}] {idx}/{total} done, {elapsed:.1f}s elapsed", flush=True)
             yield {"input_features": input_features, "labels": labels}
     return gen
-
-# %%
-from datasets import Dataset
 
 train_dataset = Dataset.from_generator(make_generator(ds["train"], "train"))
 validation_dataset = Dataset.from_generator(make_generator(ds["validation"], "validation"))
 
-print(train_dataset)
-print(validation_dataset)
-# %%
-import torch
-from dataclasses import dataclass
-from typing import Any
-
+# Collator
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
     processor: Any
@@ -114,44 +88,43 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
 data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
 
-# %%
-import evaluate
+# Metric
 metric = evaluate.load("wer")
-
 def compute_metrics(pred):
     pred_ids = pred.predictions
     label_ids = pred.label_ids
     label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
     pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-    wer = 100 * metric.compute(predictions=pred_str, references=label_str)
-    return {"wer": wer}
+    return {"wer": 100 * metric.compute(predictions=pred_str, references=label_str)}
 
-# %%
-from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
-
+# Safe Training Arguments (Max 2500 steps to capture the peak)
 training_args = Seq2SeqTrainingArguments(
-    output_dir="./whisper-small-balti",
+    output_dir="/kaggle/working/whisper-small-balti-coldstart",
     per_device_train_batch_size=8,
     gradient_accumulation_steps=2,
-    learning_rate=1e-5,
-    warmup_steps=100,
-    max_steps=1000,
+    learning_rate=1e-4,
+    warmup_steps=500,
+    max_steps=2500,                    # Targets the Step 2000-2500 peak range
     gradient_checkpointing=True,
     fp16=True,
     eval_strategy="steps",
+    save_strategy="steps",
+    eval_steps=500,
+    save_steps=500,
     per_device_eval_batch_size=8,
     predict_with_generate=True,
     generation_max_length=225,
-    save_steps=100,
-    eval_steps=100,
-    logging_steps=25,
+    logging_steps=50,
     report_to=[],
+    
+    # --- CRITICAL DISK SAFETY FLAGS ---
+    save_only_model=True,              # Eliminates 1.8GB optimizer file saves
+    save_total_limit=2,                # Automatically deletes older checkpoints
     load_best_model_at_end=True,
     metric_for_best_model="wer",
     greater_is_better=False,
-    push_to_hub=True,
-    hub_model_id="YuvrajGujari/whisper-small-balti",
+    push_to_hub=False,
 )
 
 trainer = Seq2SeqTrainer(
@@ -164,8 +137,6 @@ trainer = Seq2SeqTrainer(
     processing_class=processor,
 )
 
-# %%
+# Launch
 trainer.train()
-
-# %%
 trainer.push_to_hub()
