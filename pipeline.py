@@ -13,6 +13,7 @@ Usage:
 import os
 import subprocess
 
+import numpy as np
 import torch
 import soundfile as sf
 from huggingface_hub import login
@@ -59,26 +60,29 @@ class BaltiTarjumanPipeline:
         self.vad_model, vad_utils = torch.hub.load(
             "snakers4/silero-vad", "silero_vad", force_reload=False
         )
-        (self._get_speech_timestamps, _, self._read_audio, _, _) = vad_utils
+        (self._get_speech_timestamps, _, self._read_audio, self.VADIterator, _) = vad_utils
 
     def _load_asr(self):
+        dtype = torch.float16 if self.device == "cuda" else torch.float32
+
         # Primary ASR — fine-tuned Whisper
         self.whisper_model = WhisperForConditionalGeneration.from_pretrained(
-            WHISPER_MODEL_ID
+            WHISPER_MODEL_ID, torch_dtype=dtype
         ).to(self.device)
         self.whisper_processor = WhisperProcessor.from_pretrained(WHISPER_MODEL_ID)
 
         # Backup ASR — project's own fine-tuned wav2vec2 (not generic MMS)
         self.wav2vec2_model = Wav2Vec2ForCTC.from_pretrained(
-            WAV2VEC2_MODEL_ID
+            WAV2VEC2_MODEL_ID, torch_dtype=dtype
         ).to(self.device)
         self.wav2vec2_processor = AutoProcessor.from_pretrained(WAV2VEC2_MODEL_ID)
 
     def _load_mt(self):
+        dtype = torch.float16 if self.device == "cuda" else torch.float32
         self.mt_tokenizer = AutoTokenizer.from_pretrained(NLLB_MODEL_ID)
-        self.mt_model = AutoModelForSeq2SeqLM.from_pretrained(NLLB_MODEL_ID).to(
-            self.device
-        )
+        self.mt_model = AutoModelForSeq2SeqLM.from_pretrained(
+            NLLB_MODEL_ID, torch_dtype=dtype
+        ).to(self.device)
         self.mt_tokenizer.src_lang = "bft_Arab"
 
     def _load_tts(self):
@@ -102,15 +106,14 @@ class BaltiTarjumanPipeline:
         Try Whisper first (primary). On failure, fall back to the project's
         fine-tuned wav2vec2 backup. Returns (text, source, is_reliable).
         Both models were fine-tuned specifically on this project's Balti
-        data, so both are treated as reliable — unlike the earlier
-        MMS-based fallback, which was flagged unreliable due to a
-        script/language mismatch.
+        data, so both are treated as reliable.
         """
         try:
+            dtype = torch.float16 if self.device == "cuda" else torch.float32
             input_features = self.whisper_processor.feature_extractor(
                 audio_array, sampling_rate=sr
             ).input_features
-            input_features = torch.tensor(input_features).to(self.device)
+            input_features = torch.tensor(input_features, dtype=dtype).to(self.device)
             predicted_ids = self.whisper_model.generate(input_features)
             text = self.whisper_processor.batch_decode(
                 predicted_ids, skip_special_tokens=True
@@ -137,11 +140,36 @@ class BaltiTarjumanPipeline:
         return self.mt_tokenizer.batch_decode(generated, skip_special_tokens=True)[0]
 
     def synthesize(self, english_text, output_path="output.wav"):
+        """Batch use — writes full audio (all TTS chunks concatenated) to disk."""
         generator = self.tts_pipeline(english_text, voice="af_heart")
+        chunks = []
         for _, _, audio in generator:
-            sf.write(output_path, audio, 24000)
-            return output_path
-        return None
+            if hasattr(audio, "cpu"):
+                audio = audio.cpu().numpy()
+            chunks.append(audio)
+        if not chunks:
+            return None
+        full_audio = np.concatenate(chunks)
+        sf.write(output_path, full_audio, 24000)
+        return output_path
+
+    def synthesize_array(self, english_text):
+        """
+        Streaming use — same as synthesize(), but returns (audio_array,
+        sample_rate) directly, no disk write/read. Concatenates ALL TTS
+        chunks (Kokoro yields one chunk per clause/sentence for longer
+        text — taking only the first chunk truncates the audio).
+        """
+        generator = self.tts_pipeline(english_text, voice="af_heart")
+        chunks = []
+        for _, _, audio in generator:
+            if hasattr(audio, "cpu"):
+                audio = audio.cpu().numpy()
+            chunks.append(audio)
+        if not chunks:
+            return None, None
+        full_audio = np.concatenate(chunks)
+        return full_audio, 24000
 
     # ------------------------------------------------------------------
     # Full pipeline
@@ -172,5 +200,5 @@ class BaltiTarjumanPipeline:
 if __name__ == "__main__":
     # Quick smoke test — replace with a real Balti test clip
     pipeline = BaltiTarjumanPipeline()
-    result = pipeline.run("path/to/test_clip.wav")
-    print(result)
+    # result = pipeline.run("path/to/test_clip.wav")
+    # print(result)
