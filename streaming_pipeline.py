@@ -2,8 +2,8 @@
 StreamingBaltiTarjumanPipeline — real-time streaming layer over BaltiTarjumanPipeline.
 
 Wraps VAD -> ASR -> MT -> TTS with threaded segmentation and processing.
-Reuses BaltiTarjumanPipeline's already-loaded models; does not duplicate
-model-loading logic.
+Reuses BaltiTarjumanPipeline's already-loaded models (including its VAD
+model/VADIterator); does not duplicate model-loading logic.
 
 Usage:
     from pipeline import BaltiTarjumanPipeline
@@ -20,6 +20,7 @@ import threading
 import time
 
 import numpy as np
+import soundfile as sf
 import torch
 
 from pipeline import BaltiTarjumanPipeline
@@ -71,6 +72,8 @@ class VADSegmenter:
                     emitted = np.concatenate(self._buffer)
                 self._buffer = []
 
+        # Force-close on max duration so one long run-on sentence can't
+        # blow the latency budget for everything spoken after it.
         if self._in_speech and self._buffer:
             current_len = sum(len(b) for b in self._buffer)
             if current_len >= self.max_segment_samples:
@@ -82,7 +85,10 @@ class VADSegmenter:
         return emitted
 
     def flush(self):
-        """Force-emit any pending buffered segment — call at end of stream."""
+        """Force-emit any pending buffered segment — call at end of stream.
+        Handles the case where trailing silence is just barely over
+        min_silence_duration_ms and the "end" event never fires before
+        the stream runs out."""
         if self._in_speech and self._buffer:
             emitted = np.concatenate(self._buffer)
             self._buffer = []
@@ -100,8 +106,9 @@ class VADSegmenter:
 class StreamingBaltiTarjumanPipeline:
     """
     Wraps a BaltiTarjumanPipeline instance with streaming segmentation and
-    threaded processing. Reuses .transcribe() / .translate() / .synthesize()
-    and the already-loaded VAD model as-is — no model logic duplicated here.
+    threaded processing. Reuses .transcribe() / .translate() /
+    .synthesize_array() and the already-loaded VAD model as-is — no model
+    logic duplicated here.
     """
 
     def __init__(self, pipeline=None, frame_size=512, sample_rate=16000):
@@ -109,8 +116,6 @@ class StreamingBaltiTarjumanPipeline:
         self.sample_rate = sample_rate
         self.frame_size = frame_size
 
-        # Reuse the VAD model + VADIterator already loaded on self.pipeline —
-        # avoids loading a second VAD model onto the GPU.
         self.segmenter = VADSegmenter(
             vad_model=self.pipeline.vad_model,
             vad_iterator_cls=self.pipeline.VADIterator,
@@ -130,11 +135,12 @@ class StreamingBaltiTarjumanPipeline:
 
     def stop(self):
         self._stop_event.set()
-        self.input_queue.put(None)
+        self.input_queue.put(None)  # sentinel to unblock a queue.get()
         if self._worker_thread:
             self._worker_thread.join(timeout=5)
 
     def feed_audio_frame(self, frame: np.ndarray):
+        """Call with each raw audio frame (length == frame_size, sample_rate Hz)."""
         segment = self.segmenter.process_frame(frame)
         if segment is not None:
             self.input_queue.put(segment)
@@ -159,16 +165,15 @@ class StreamingBaltiTarjumanPipeline:
                 segment, sr=self.sample_rate
             )
             english_text = self.pipeline.translate(balti_text)
-            out_path = self.pipeline.synthesize(
-                english_text, output_path=f"stream_out_{int(t0 * 1000)}.wav"
-            )
+            audio_array, audio_sr = self.pipeline.synthesize_array(english_text)
             latency = time.time() - t0
 
             self.output_queue.put(
                 {
                     "balti_text": balti_text,
                     "english_text": english_text,
-                    "audio_path": out_path,
+                    "audio_array": audio_array,
+                    "audio_sr": audio_sr,
                     "asr_used": asr_source,
                     "processing_latency_sec": latency,
                 }
@@ -182,14 +187,15 @@ class StreamingBaltiTarjumanPipeline:
 
     def feed_wav_file(self, path, realtime=False, reset_first=True):
         """
+        Standalone test helper: reads a wav file and feeds it frame-by-frame
+        as if it were live mic input.
+
         reset_first=True (default) clears segmenter state before reading
         this file — important when feeding multiple files back-to-back,
         since VADIterator carries state across calls.
         """
         if reset_first:
             self.segmenter.reset()
-
-        import soundfile as sf
 
         audio, sr = sf.read(path, dtype="float32")
         if sr != self.sample_rate:
