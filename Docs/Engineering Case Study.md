@@ -16,7 +16,7 @@ This document records the major engineering challenges encountered during develo
 
 # System Overview
 
-The current pipeline consists of the following stages:
+The pipeline consists of the following stages, available in both a **batch** mode and a **streaming, real-time** mode:
 
 ```text
 Balti Speech
@@ -43,7 +43,7 @@ Text-to-Speech (TTS)
 English Speech
 ```
 
-Each stage was developed independently before being integrated into the complete pipeline.
+Each stage was developed independently before being integrated into the complete pipeline. The batch pipeline (`pipeline.py`) exposes this as a class-based API, and the streaming pipeline (`streaming_pipeline.py`) builds directly on top of it — importing the same class rather than duplicating logic — to deliver continuous, near real-time translation from a live microphone feed.
 
 ---
 
@@ -259,6 +259,53 @@ A system that clearly reports uncertainty is more trustworthy than one that sile
 
 ---
 
+## Challenge 10 — Packaging the Pipeline as a Reusable Class
+
+### Problem
+
+The working pipeline existed as a set of scripts rather than a coherent, reusable component. This made it harder to reason about, harder to reuse across the batch and streaming variants, and easy to leave stale references behind as pieces changed — including a leftover backup-ASR reference that still pointed at a generic pretrained model instead of the project's own fine-tuned one.
+
+### Approach
+
+The pipeline was refactored into a class-based `BaltiTarjumanPipeline`, consolidating VAD, ASR, MT, and TTS behind a single, testable interface. Refactoring surfaced the stale backup-ASR reference, which was corrected to point at the project's fine-tuned model.
+
+### Outcome
+
+A single, reusable pipeline class that both the batch and streaming entry points build on, with no duplicated model-loading or inference logic between them.
+
+### Lesson Learned
+
+Packaging code into a proper interface isn't just cleanup — the act of refactoring surfaces stale assumptions that are easy to miss when logic is scattered across scripts.
+
+---
+
+## Challenge 11 — Real-Time Streaming Translation
+
+### Problem
+
+The batch pipeline processed complete audio files, but a real-time speech translator needs to process a continuous, unsegmented audio stream — detecting when someone starts and stops speaking, and feeding each spoken segment through the pipeline with low enough latency to feel conversational.
+
+### Approach
+
+A `VADSegmenter`, built on Silero's `VADIterator`, was combined with a threaded `StreamingBaltiTarjumanPipeline` that used worker threads and queues to keep audio capture, inference, and playback from blocking one another. Getting this working end-to-end surfaced four distinct bugs, each traced to a clear root cause:
+
+1. **Cross-file state leakage** — the VAD segmenter's internal "triggered" state carried over between separate file tests, since it was never reset. Fixed by automatically resetting the segmenter's state per file.
+2. **Segments that never closed** — a segment ending right at the minimum-silence threshold could get stuck with no "end" event ever firing, silently dropping the tail of an utterance. Fixed by adding an explicit `flush()` method to force-close a pending segment.
+3. **Truncated TTS output** — Kokoro's TTS yields multiple audio chunks for longer sentences, but the code only kept the first one, silently truncating anything past a short phrase. Fixed by concatenating all yielded chunks before returning audio.
+4. **Interrupted live playback** — Gradio's live output component kept cutting off mid-playback because the streaming callback returned `None` on every idle tick, which Gradio interprets as "clear the player." Fixed by returning `gr.skip()` on idle ticks instead of `None`.
+
+Latency was further reduced by loading models in fp16 and keeping TTS entirely in-memory, avoiding disk writes/reads in the streaming path.
+
+### Outcome
+
+Confirmed working end-to-end via live microphone input through Gradio, with full sentences intact and round-trip latency of roughly 2–3 seconds — within the project's 2–4 second target for conversational feel.
+
+### Lesson Learned
+
+Streaming systems fail in ways batch systems don't — state that leaks across boundaries, events that never fire, output that gets silently truncated, and UI frameworks with implicit conventions (like `None` meaning "clear") are all invisible until you test the continuous, real-time path specifically. Each of these four bugs would have been undetectable from single-file batch testing alone.
+
+---
+
 # Key Engineering Takeaways
 
 Throughout the project, several principles consistently proved valuable:
@@ -270,6 +317,7 @@ Throughout the project, several principles consistently proved valuable:
 * Prefer simplifying pipelines over adding more complexity.
 * Design infrastructure that is portable across platforms.
 * Fail safely instead of silently.
+* Test the continuous, real-time path explicitly — batch testing alone won't surface streaming-specific failure modes.
 
 ---
 
@@ -278,16 +326,15 @@ Throughout the project, several principles consistently proved valuable:
 Current areas for future work include:
 
 * Longer Whisper fine-tuning with matched training budgets.
-* Expanded Balti–English parallel data.
+* Expanded Balti–English parallel data, to move MT quality beyond its current small-scale training set.
 * More comprehensive evaluation across multiple ASR models.
 * Automated experiment tracking.
 * Containerized deployment for reproducibility.
-* Performance optimization for real-time inference.
 
 ---
 
 # Closing Thoughts
 
-Balti Tarjuman has been an exercise in far more than model training. Building an end-to-end system for a low-resource language required solving challenges across data engineering, multilingual NLP, speech processing, cloud infrastructure, and system integration.
+Balti Tarjuman has been an exercise in far more than model training. Building an end-to-end system for a low-resource language required solving challenges across data engineering, multilingual NLP, speech processing, cloud infrastructure, system integration, and — in its final phase — real-time systems design.
 
-The most valuable lesson from this project is that successful machine learning systems are built by consistently solving many interconnected engineering problems—not by relying on a single model or algorithm.
+The most valuable lesson from this project is that successful machine learning systems are built by consistently solving many interconnected engineering problems — not by relying on a single model or algorithm. The streaming phase in particular reinforced this: a pipeline that works correctly on batch input is not the same thing as a pipeline that works correctly in real time, and the gap between the two is where the more interesting engineering problems live.
