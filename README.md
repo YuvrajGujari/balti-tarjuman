@@ -20,7 +20,7 @@ Historically, Balti has had virtually no representation in natural language proc
 
 ![Balti Tarjuman live mic demo](https://github.com/user-attachments/assets/e7048524-c1e4-4a7e-b19e-8ef65dec22f1)
 
-🎬 [Watch the full demo with audio (1:04)](PASTE_FULL_VIDEO_URL_HERE)
+🎬 [Watch the full demo with audio (1:04)](https://github.com/user-attachments/assets/ffed7c0f-b8a0-4312-b6d5-eccdb7e58e85)
 
 ---
 
@@ -28,11 +28,11 @@ Historically, Balti has had virtually no representation in natural language proc
 
 The pipeline processes continuous audio through four sequential stages:
 
-```
-┌─────────────────┐     ┌──────────────────────┐     ┌───────────────────────┐     ┌────────────────┐
-│   Silero VAD    │ ──> │ Fine-tuned Whisper   │ ──> │   Fine-tuned NLLB     │ ──> │  Kokoro-82M    │
-│ (Voice Activity) │     │  (ASR Engine)         │     │  (Translation Engine) │     │  (TTS Engine)  │
-└─────────────────┘     └──────────────────────┘     └───────────────────────┘     └────────────────┘
+```mermaid
+flowchart LR
+    A[🎙️ Silero VAD<br/>Voice Activity Detection] --> B[📝 Fine-tuned Whisper<br/>ASR Engine]
+    B --> C[🌐 Fine-tuned NLLB<br/>Translation Engine]
+    C --> D[🔊 Kokoro-82M<br/>TTS Engine]
 ```
 
 1. **Voice Activity Detection (VAD):** [Silero VAD](https://github.com/snakers4/silero-vad) isolates valid speech frames and trims silent segments.
@@ -44,7 +44,6 @@ This same four-stage pipeline runs in two modes:
 
 - **Batch** (`pipeline.py`) — translate a complete audio file via `BaltiTarjumanPipeline.run()`.
 - **Streaming** (`streaming_pipeline.py`) — continuous VAD-based segmentation of a live audio stream, feeding each detected utterance through the same underlying pipeline in near real-time. Built on Silero's `VADIterator` plus a threaded worker/queue design so capture, inference, and playback don't block one another. The streaming layer reuses the batch pipeline's already-loaded models rather than duplicating them.
-
 ---
 
 ## 🏆 ASR Benchmark Leaderboard
