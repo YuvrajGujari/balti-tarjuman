@@ -24,15 +24,6 @@ Historically, Balti has had virtually no representation in natural language proc
 
 ---
 
-Here is a updated version of your **System Architecture** section, formatted in clean Markdown ready to copy directly into your `README.md`.
-
-It incorporates the **fallback router**, the **Mermaid diagram with decision logic**, and explicit mentions of your **resilience & failover engineering**.
-
----
-
-### Markdown to Copy/Paste into `README.md`
-
-```markdown
 ## 🏗️ System Architecture & Failover Design
 
 The pipeline processes continuous audio through four sequential stages with integrated **circuit-breaker resilience**:
