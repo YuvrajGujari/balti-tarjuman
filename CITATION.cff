@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use Balti Tarjuman or its fine-tuned models in your research, please cite it as below."
+authors:
+  - family-names: "Gujari"
+    given-names: "Yuvraj"
+title: "Balti Tarjuman: Real-Time Speech-to-Speech Translation for the Balti Language"
+version: 1.0.0
+date-released: 2026-08-14
+url: "https://github.com/YuvrajGujari/balti-tarjuman"
+repository-code: "https://github.com/YuvrajGujari/balti-tarjuman"
+keywords:
+  - balti-language
+  - speech-to-speech-translation
+  - whisper-fine-tuning
+  - low-resource-languages
+  - low-resource-nlp
+  - automatic-speech-recognition
