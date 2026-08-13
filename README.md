@@ -24,26 +24,48 @@ Historically, Balti has had virtually no representation in natural language proc
 
 ---
 
-## 🏗️ System Architecture
+Here is a updated version of your **System Architecture** section, formatted in clean Markdown ready to copy directly into your `README.md`.
 
-The pipeline processes continuous audio through four sequential stages:
+It incorporates the **fallback router**, the **Mermaid diagram with decision logic**, and explicit mentions of your **resilience & failover engineering**.
+
+---
+
+### Markdown to Copy/Paste into `README.md`
+
+```markdown
+## 🏗️ System Architecture & Failover Design
+
+The pipeline processes continuous audio through four sequential stages with integrated **circuit-breaker resilience**:
 
 ```mermaid
 flowchart LR
-    A[🎙️ Silero VAD<br/>Voice Activity Detection] --> B[📝 Fine-tuned Whisper<br/>ASR Engine]
-    B --> C[🌐 Fine-tuned NLLB<br/>Translation Engine]
-    C --> D[🔊 Kokoro-82M<br/>TTS Engine]
+    A[🎙️ Silero VAD<br/>Voice Activity Detection] --> B{ASR Router}
+    B -- Primary Engine<br/>17.40% WER --> C[📝 Fine-tuned Whisper-small]
+    B -- Latency/Timeout Fallback<br/>22.11% WER --> D[⚡ Fine-tuned Wav2Vec2 XLS-R]
+    C --> E[🌐 Fine-tuned NLLB-200<br/>Translation Engine]
+    D --> E
+    E --> F[🔊 Kokoro-82M<br/>TTS Engine]
+
 ```
 
-1. **Voice Activity Detection (VAD):** [Silero VAD](https://github.com/snakers4/silero-vad) isolates valid speech frames and trims silent segments.
-2. **Automatic Speech Recognition (ASR):** Fine-tuned [`openai/whisper-small`](https://huggingface.co/YuvrajGujari/whisper-small-balti) transcribes Balti audio into Perso-Arabic text.
-3. **Machine Translation (MT):** Fine-tuned [`facebook/nllb-200-distilled-600M`](https://huggingface.co/YuvrajGujari/nllb-balti-mt) translates Balti text into English.
-4. **Text-to-Speech (TTS):** [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) synthesizes English translations into audio.
+1. **Voice Activity Detection (VAD):** [Silero VAD](https://github.com/snakers4/silero-vad) isolates valid speech frames, drops silent segments, and handles dynamic noise floor trimming.
+2. **Resilient ASR Engine (Whisper + Wav2Vec2 Fallback):**
+* **Primary Engine:** Fine-tuned [`openai/whisper-small`](https://huggingface.co/YuvrajGujari/whisper-small-balti) (**17.40% WER**) transcribes Balti speech into Perso-Arabic (Nastaliq) text.
+* **Fallback Circuit Breaker:** If Whisper exceeds processing latency bounds or encounters decoder stalls on noisy live inputs, the system gracefully route-fails to an encoder-only CTC model—fine-tuned [`wav2vec2-xls-r-300m`](https://huggingface.co/YuvrajGujari/wav2vec2-balti-specaugment) (**22.11% WER**). This non-autoregressive pass guarantees predictable execution times and prevents dropped frames during live streaming.
 
-This same four-stage pipeline runs in two modes:
 
-- **Batch** (`pipeline.py`) — translate a complete audio file via `BaltiTarjumanPipeline.run()`.
-- **Streaming** (`streaming_pipeline.py`) — continuous VAD-based segmentation of a live audio stream, feeding each detected utterance through the same underlying pipeline in near real-time. Built on Silero's `VADIterator` plus a threaded worker/queue design so capture, inference, and playback don't block one another. The streaming layer reuses the batch pipeline's already-loaded models rather than duplicating them.
+3. **Machine Translation (MT):** Fine-tuned [`facebook/nllb-200-distilled-600M`](https://huggingface.co/YuvrajGujari/nllb-balti-mt) converts translated Perso-Arabic Balti text into target English syntax.
+4. **Text-to-Speech (TTS):** [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) synthesizes high-quality English audio from the translated text.
+
+---
+
+### Pipeline Execution Modes
+
+The unified pipeline operates in two modes sharing a single model lifecycle:
+
+* **Batch Mode** (`pipeline.py`) — Processes standard `.wav` files via `BaltiTarjumanPipeline.run()` for full offline translations.
+* **Streaming Mode** (`streaming_pipeline.py`) — Real-time audio streaming built on top of Silero's `VADIterator` coupled with an asynchronous, multi-threaded worker/queue pipeline. Captures, infers, and outputs translated speech with low round-trip latency (~2–3s) without locking system audio buffers or duplicating GPU memory overhead.
+
 ---
 
 ## 🏆 ASR Benchmark Leaderboard
