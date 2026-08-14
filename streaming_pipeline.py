@@ -18,6 +18,7 @@ Usage:
 import queue
 import threading
 import time
+from collections import Counter
 
 import numpy as np
 import soundfile as sf
@@ -108,7 +109,10 @@ class StreamingBaltiTarjumanPipeline:
     Wraps a BaltiTarjumanPipeline instance with streaming segmentation and
     threaded processing. Reuses .transcribe() / .translate() /
     .synthesize_array() and the already-loaded VAD model as-is — no model
-    logic duplicated here.
+    logic duplicated here. Since .transcribe() now includes a latency-
+    bounded fallback to wav2vec2 (see pipeline.py), this layer inherits
+    that behavior automatically with no changes needed — a slow Whisper
+    call on one segment can no longer stall the live stream.
     """
 
     def __init__(self, pipeline=None, frame_size=512, sample_rate=16000):
@@ -127,6 +131,13 @@ class StreamingBaltiTarjumanPipeline:
         self.output_queue = queue.Queue()
         self._stop_event = threading.Event()
         self._worker_thread = None
+
+        # Tracks which ASR path served each segment (whisper /
+        # wav2vec2_fallback_timeout / wav2vec2_fallback_error) — useful
+        # for a real "how often does the fallback actually trigger in a
+        # live session" stat, worth reporting in the case study rather
+        # than just asserting the fallback works in isolated testing.
+        self.asr_usage_counts = Counter()
 
     def start(self):
         self._stop_event.clear()
@@ -164,6 +175,7 @@ class StreamingBaltiTarjumanPipeline:
             balti_text, asr_source, _ = self.pipeline.transcribe(
                 segment, sr=self.sample_rate
             )
+            self.asr_usage_counts[asr_source] += 1
             english_text = self.pipeline.translate(balti_text)
             audio_array, audio_sr = self.pipeline.synthesize_array(english_text)
             latency = time.time() - t0
