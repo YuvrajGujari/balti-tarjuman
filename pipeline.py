@@ -12,6 +12,7 @@ Usage:
 
 import os
 import subprocess
+import concurrent.futures
 
 import numpy as np
 import torch
@@ -27,7 +28,7 @@ from transformers import (
 )
 
 WHISPER_MODEL_ID = "YuvrajGujari/whisper-small-balti"
-WAV2VEC2_MODEL_ID = "YuvrajGujari/wav2vec2-balti-specaugment"  # 21.11% WER, cold-start + SpecAugment retrain
+WAV2VEC2_MODEL_ID = "YuvrajGujari/wav2vec2-balti-specaugment"  # 22.11% WER, cold-start + SpecAugment retrain
 NLLB_MODEL_ID = "YuvrajGujari/nllb-balti-mt"
 
 
@@ -38,7 +39,7 @@ class BaltiTarjumanPipeline:
     entry point for the full batch pipeline.
     """
 
-    def __init__(self, hf_token=None, device=None):
+    def __init__(self, hf_token=None, device=None, whisper_timeout_sec=3.61):
         if hf_token is None:
             hf_token = os.environ.get("HF_TOKEN")
         if hf_token:
@@ -46,6 +47,14 @@ class BaltiTarjumanPipeline:
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         print(f"BaltiTarjumanPipeline: using device={self.device}")
+
+        # Latency bound for the primary ASR (Whisper) before falling back
+        # to wav2vec2. Measured empirically: n=20 held-out test clips,
+        # median 0.70s, p95 3.01s -> threshold set to p95 + 20% margin
+        # (3.61s). Re-measure if hardware, model, or typical utterance
+        # length changes meaningfully.
+        self.whisper_timeout_sec = whisper_timeout_sec
+        self._asr_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
         self._load_vad()
         self._load_asr()
@@ -101,34 +110,73 @@ class BaltiTarjumanPipeline:
         timestamps = self._get_speech_timestamps(wav, self.vad_model, sampling_rate=sr)
         return wav, timestamps
 
+    def _run_whisper(self, audio_array, sr):
+        """The actual Whisper call — run inside a worker thread so
+        transcribe() can bound how long it waits on it."""
+        dtype = torch.float16 if self.device == "cuda" else torch.float32
+        input_features = self.whisper_processor.feature_extractor(
+            audio_array, sampling_rate=sr
+        ).input_features
+        input_features = torch.tensor(input_features, dtype=dtype).to(self.device)
+        predicted_ids = self.whisper_model.generate(input_features)
+        return self.whisper_processor.batch_decode(
+            predicted_ids, skip_special_tokens=True
+        )[0]
+
+    def _run_wav2vec2_fallback(self, audio_array, sr):
+        """The fine-tuned wav2vec2 backup ASR call."""
+        dtype = torch.float16 if self.device == "cuda" else torch.float32
+        inputs = self.wav2vec2_processor(
+            audio_array, sampling_rate=sr, return_tensors="pt"
+        )
+        # Cast float tensors to match the model's dtype (fp16 on CUDA).
+        # Without this, the processor's default float32 output mismatches
+        # the model's fp16 weights and raises a RuntimeError — a real
+        # bug that was only found by deliberately forcing this fallback
+        # path, since normal testing almost never hits this branch.
+        inputs = {
+            k: (v.to(self.device, dtype=dtype) if torch.is_floating_point(v) else v.to(self.device))
+            for k, v in inputs.items()
+        }
+        with torch.no_grad():
+            logits = self.wav2vec2_model(**inputs).logits
+        ids = torch.argmax(logits, dim=-1)[0]
+        return self.wav2vec2_processor.decode(ids)
+
     def transcribe(self, audio_array, sr=16000):
         """
-        Try Whisper first (primary). On failure, fall back to the project's
-        fine-tuned wav2vec2 backup. Returns (text, source, is_reliable).
+        Try Whisper first (primary), bounded by self.whisper_timeout_sec.
+        Falls back to the project's fine-tuned wav2vec2 backup in two
+        cases: Whisper raises an exception, or Whisper doesn't finish
+        within the latency bound. Returns (text, source, is_reliable).
+
+        Note on the timeout path: this uses a worker-thread timeout, not
+        a true CUDA-level cancellation — if Whisper times out, its
+        generate() call keeps running in the background until it
+        finishes, competing for GPU time with the wav2vec2 fallback that
+        starts immediately after. A timeout event is therefore somewhat
+        *more* GPU-expensive momentarily, not free — worth knowing before
+        assuming a timeout is a cheap escape hatch.
+
         Both models were fine-tuned specifically on this project's Balti
         data, so both are treated as reliable.
         """
+        future = self._asr_executor.submit(self._run_whisper, audio_array, sr)
         try:
-            dtype = torch.float16 if self.device == "cuda" else torch.float32
-            input_features = self.whisper_processor.feature_extractor(
-                audio_array, sampling_rate=sr
-            ).input_features
-            input_features = torch.tensor(input_features, dtype=dtype).to(self.device)
-            predicted_ids = self.whisper_model.generate(input_features)
-            text = self.whisper_processor.batch_decode(
-                predicted_ids, skip_special_tokens=True
-            )[0]
+            text = future.result(timeout=self.whisper_timeout_sec)
             return text, "whisper", True
+        except concurrent.futures.TimeoutError:
+            print(
+                f"Whisper exceeded {self.whisper_timeout_sec}s latency bound — "
+                f"falling back to wav2vec2 (abandoned Whisper call keeps "
+                f"running in the background; its result is discarded)."
+            )
+            text = self._run_wav2vec2_fallback(audio_array, sr)
+            return text, "wav2vec2_fallback_timeout", True
         except Exception as e:
             print(f"Whisper failed ({e}) — falling back to wav2vec2 backup ASR.")
-            inputs = self.wav2vec2_processor(
-                audio_array, sampling_rate=sr, return_tensors="pt"
-            ).to(self.device)
-            with torch.no_grad():
-                logits = self.wav2vec2_model(**inputs).logits
-            ids = torch.argmax(logits, dim=-1)[0]
-            text = self.wav2vec2_processor.decode(ids)
-            return text, "wav2vec2_fallback", True
+            text = self._run_wav2vec2_fallback(audio_array, sr)
+            return text, "wav2vec2_fallback_error", True
 
     def translate(self, balti_text):
         inputs = self.mt_tokenizer(balti_text, return_tensors="pt").to(self.device)
@@ -195,6 +243,10 @@ class BaltiTarjumanPipeline:
             "audio_path": out_path,
             "asr_used": asr_source,
         }
+
+    def close(self):
+        """Shut down the ASR worker thread pool cleanly."""
+        self._asr_executor.shutdown(wait=False)
 
 
 if __name__ == "__main__":
