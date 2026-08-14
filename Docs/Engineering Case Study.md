@@ -43,7 +43,7 @@ Text-to-Speech (TTS)
 English Speech
 ```
 
-Each stage was developed independently before being integrated into the complete pipeline. The batch pipeline (`pipeline.py`) exposes this as a class-based API, and the streaming pipeline (`streaming_pipeline.py`) builds directly on top of it — importing the same class rather than duplicating logic — to deliver continuous, near real-time translation from a live microphone feed.
+Each stage was developed independently before being integrated into the complete pipeline. The batch pipeline (`pipeline.py`) exposes this as a class-based API, and the streaming pipeline (`streaming_pipeline.py`) builds directly on top of it — importing the same class rather than duplicating logic — to deliver continuous, near real-time translation from a live microphone feed. The ASR stage itself is resilient by design: a primary model with a bounded-latency fallback to a backup model, detailed in Challenge 12 below.
 
 ---
 
@@ -306,6 +306,34 @@ Streaming systems fail in ways batch systems don't — state that leaks across b
 
 ---
 
+## Challenge 12 — Making the ASR Fallback Actually Latency-Aware (and Testing It)
+
+### Problem
+
+The original ASR fallback (Challenge 9) only triggered on a Whisper *exception* — it had no defense against Whisper simply running slow on a given input. For the live streaming path specifically, this mattered: a single unusually slow inference could stall the whole session, with no mechanism to detect or route around it. The fallback also had zero deliberate test coverage — it had never actually been forced to trigger and observed end-to-end, only reasoned about.
+
+### Approach
+
+Implemented a bounded-latency fallback: Whisper now runs inside a worker thread via `concurrent.futures.ThreadPoolExecutor`, and if it doesn't return within a configurable `whisper_timeout_sec`, the pipeline stops waiting and falls through to the wav2vec2 backup immediately, tagging the result as `wav2vec2_fallback_timeout` (distinct from `wav2vec2_fallback_error` for the original exception path — useful for knowing which failure mode is actually occurring in practice).
+
+To set the timeout threshold from real data rather than a guess, I built a small test script that pulls held-out clips directly from the project's own test split (`YuvrajGujari/balti-tarjuman-data`) and measures Whisper's actual wall-clock latency. Two separate measurement runs (n=20 each) gave median latency around 0.70–0.72s but noticeably different p95/max values (3.01s vs. 1.26s) — likely GPU warm-up effects or natural spread across a small sample, not a real change in the model. Rather than picking whichever number looked better, I treated the variance itself as the finding: median latency is stable, but tail latency needs a conservative margin, not a single-run point estimate.
+
+The same test script also deliberately forced the timeout path (`whisper_timeout_sec=0.01`, an impossible threshold) on a real clip and asserted that the pipeline correctly routed to `wav2vec2_fallback_timeout` and returned a valid, non-empty transcript — not just that the code ran without raising an error.
+
+### Outcome
+
+This deliberate test immediately surfaced a real, previously-undetected bug: the wav2vec2 model is loaded in fp16 on CUDA, but the processor's output stayed in the default float32, causing a `RuntimeError: Input type (float) and bias type (c10::Half) should be the same` the moment the fallback path actually ran. This bug had been present since the original exception-only fallback — it simply never triggered during normal testing, since Whisper rarely raised exceptions on clean test clips. Fixed by explicitly casting float tensors to match the model's dtype before the forward pass.
+
+With the bug fixed, both fallback paths (timeout and exception) were confirmed working end-to-end: correct routing, correct tagging, valid transcript returned. The streaming pipeline was also updated to track a running per-session count of which ASR path served each segment (`whisper` / `wav2vec2_fallback_timeout` / `wav2vec2_fallback_error`), so a live session's actual fallback trigger rate can be reported as a real operational statistic rather than something only validated in isolated testing.
+
+One design tradeoff is stated honestly rather than glossed over: this is a thread-level timeout, not true CUDA-level cancellation. An abandoned Whisper call keeps running on the GPU in the background until it finishes, competing for compute with the wav2vec2 fallback that starts immediately after — a timeout event is therefore momentarily *more* GPU-expensive, not a free escape hatch.
+
+### Lesson Learned
+
+A fallback path that has never been deliberately, forcibly triggered and observed is not a tested fallback — it's an assumption. The dtype bug here had nothing to do with the timeout logic itself; it was a latent, unrelated bug sitting in code that looked correct and had simply never executed under real conditions. This is the same category of lesson as the streaming bugs in Challenge 11: reliability mechanisms need to be exercised under the exact failure condition they exist to handle, not just reasoned about from the happy path.
+
+---
+
 # Key Engineering Takeaways
 
 Throughout the project, several principles consistently proved valuable:
@@ -318,6 +346,8 @@ Throughout the project, several principles consistently proved valuable:
 * Design infrastructure that is portable across platforms.
 * Fail safely instead of silently.
 * Test the continuous, real-time path explicitly — batch testing alone won't surface streaming-specific failure modes.
+* A fallback or safety mechanism that has never been deliberately forced to trigger is unverified, not tested — the failure path itself can silently harbor bugs.
+* When a measurement varies across repeated runs, report the variance honestly and design conservatively around it, rather than presenting a single favorable run as the definitive number.
 
 ---
 
@@ -330,11 +360,13 @@ Current areas for future work include:
 * More comprehensive evaluation across multiple ASR models.
 * Automated experiment tracking.
 * Containerized deployment for reproducibility.
+* A true CUDA-level cancellation for the ASR timeout fallback, so an abandoned Whisper call stops consuming GPU resources immediately rather than finishing in the background.
+* A larger-scale, statistically robust latency benchmark (more than n=20, multiple hardware configurations) to replace the current informally-measured timeout threshold with a rigorously validated one.
 
 ---
 
 # Closing Thoughts
 
-Balti Tarjuman has been an exercise in far more than model training. Building an end-to-end system for a low-resource language required solving challenges across data engineering, multilingual NLP, speech processing, cloud infrastructure, system integration, and — in its final phase — real-time systems design.
+Balti Tarjuman has been an exercise in far more than model training. Building an end-to-end system for a low-resource language required solving challenges across data engineering, multilingual NLP, speech processing, cloud infrastructure, system integration, and — in its final phases — real-time systems design and reliability engineering.
 
-The most valuable lesson from this project is that successful machine learning systems are built by consistently solving many interconnected engineering problems — not by relying on a single model or algorithm. The streaming phase in particular reinforced this: a pipeline that works correctly on batch input is not the same thing as a pipeline that works correctly in real time, and the gap between the two is where the more interesting engineering problems live.
+The most valuable lesson from this project is that successful machine learning systems are built by consistently solving many interconnected engineering problems — not by relying on a single model or algorithm. The streaming phase reinforced that a pipeline correct on batch input is not the same thing as one correct in real time; the ASR fallback work reinforced a related point one level deeper — a reliability mechanism that has never been deliberately tested under its own failure condition isn't actually reliable, it's untested. Both lessons point the same direction: the gap between "should work" and "verified to work" is where the real engineering happens.
