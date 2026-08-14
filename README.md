@@ -24,72 +24,68 @@ Balti remains severely under-resourced in NLP and speech technology, with limite
 
 ---
 
-## 🏗️ System Architecture & Failover Design
+## 🏗️ System Architecture
 
-The pipeline processes continuous audio through four sequential stages with integrated **circuit-breaker resilience**:
+The pipeline processes continuous audio through four sequential stages, with an automatic ASR fallback for robustness:
 
 ```mermaid
 flowchart LR
-    A[🎙️ Silero VAD<br/>Voice Activity Detection] --> B{ASR Router}
-    B -- Primary Engine<br/>17.40% WER --> C[📝 Fine-tuned Whisper-small]
-    B -- Latency/Timeout Fallback<br/>21.11% WER --> D[⚡ Fine-tuned Wav2Vec2 XLS-R]
+    A[🎙️ Silero VAD<br/>Voice Activity Detection] --> B{ASR}
+    B -- Primary<br/>17.40% WER --> C[📝 Fine-tuned Whisper-small]
+    B -- On failure, falls back to<br/>22.11% WER --> D[⚡ Fine-tuned Wav2Vec2 XLS-R]
     C --> E[🌐 Fine-tuned NLLB-200<br/>Translation Engine]
     D --> E
     E --> F[🔊 Kokoro-82M<br/>TTS Engine]
 ```
 
-1. **Voice Activity Detection (VAD):** [Silero VAD](https://github.com/snakers4/silero-vad) isolates valid speech frames, drops silent segments, and handles dynamic noise floor trimming.
+1. **Voice Activity Detection (VAD):** [Silero VAD](https://github.com/snakers4/silero-vad) isolates valid speech frames and trims silent segments.
 
-2. **Resilient ASR Engine (Whisper + Wav2Vec2 Fallback):**
+2. **ASR (Whisper primary, Wav2Vec2 fallback):**
 
-   * **Primary Engine:** Fine-tuned [`openai/whisper-small`](https://huggingface.co/YuvrajGujari/whisper-small-balti) (**17.40% WER**) transcribes Balti speech into Perso-Arabic (Nastaliq) text.
-   * **Fallback Circuit Breaker:** If Whisper exceeds processing latency bounds or encounters decoder stalls on noisy live inputs, the system gracefully route-fails to an encoder-only CTC model—fine-tuned [`wav2vec2-xls-r-300m`](https://huggingface.co/YuvrajGujari/wav2vec2-balti-specaugment) (**21.11% WER**). This non-autoregressive pass provides more predictable execution times and helps prevent dropped frames during live streaming.
+   * **Primary:** Fine-tuned [`openai/whisper-small`](https://huggingface.co/YuvrajGujari/whisper-small-balti) (**17.40% WER**) transcribes Balti speech into Perso-Arabic (Nastaliq) text.
+   * **Fallback:** The pipeline falls back to a fine-tuned [`wav2vec2-xls-r-300m`](https://huggingface.co/YuvrajGujari/wav2vec2-balti-specaugment) CTC model (**22.11% WER**) in two cases: if Whisper raises an exception, or if Whisper's transcription exceeds a configurable latency bound (default 3s) — the latter runs Whisper in a worker thread and abandons waiting for it once the bound is hit, so a single slow inference can't stall the live pipeline. Both fallback paths are logged separately (`wav2vec2_fallback_error` vs `wav2vec2_fallback_timeout`) for debugging which failure mode is actually occurring in practice.
 
-3. **Machine Translation (MT):** Fine-tuned [`facebook/nllb-200-distilled-600M`](https://huggingface.co/YuvrajGujari/nllb-balti-mt) converts translated Perso-Arabic Balti text into target English syntax.
+3. **Machine Translation (MT):** Fine-tuned [`facebook/nllb-200-distilled-600M`](https://huggingface.co/YuvrajGujari/nllb-balti-mt) translates Perso-Arabic Balti text into English.
 
-4. **Text-to-Speech (TTS):** [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) synthesizes high-quality English audio from the translated text.
+4. **Text-to-Speech (TTS):** [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) synthesizes English audio from the translated text.
 
 ---
 
 ### Pipeline Execution Modes
 
-The unified pipeline operates in two modes sharing a single model lifecycle:
+The pipeline runs in two modes sharing a single set of loaded models:
 
-* **Batch Mode** (`pipeline.py`) — Processes standard `.wav` files via `BaltiTarjumanPipeline.run()` for full offline translations.
-* **Streaming Mode** (`streaming_pipeline.py`) — Real-time audio streaming built on top of Silero's `VADIterator` coupled with an asynchronous, multi-threaded worker/queue pipeline. Captures, infers, and outputs translated speech with low round-trip latency (~2–3s) without locking system audio buffers or duplicating GPU memory overhead.
+* **Batch Mode** (`pipeline.py`) — processes a complete `.wav` file via `BaltiTarjumanPipeline.run()`.
+* **Streaming Mode** (`streaming_pipeline.py`) — continuous VAD-based segmentation of a live audio stream, built on Silero's `VADIterator` plus a threaded worker/queue design so capture, inference, and playback don't block one another. Reuses the batch pipeline's already-loaded models rather than duplicating them.
 
 ### Streaming Latency
 
-The current streaming pipeline achieves approximately **2–3 seconds of round-trip latency** from live microphone input.
-
-Measured on a **Kaggle T4 GPU** through a live microphone input using the Gradio interface. The measurement is based on informal repeated testing across multiple utterances and is **not intended as a controlled multi-run latency benchmark**.
+The streaming pipeline achieves approximately **2–3 seconds of round-trip latency** from live microphone input, measured on a Kaggle T4 GPU via the Gradio interface. This is based on informal repeated testing across multiple utterances, not a controlled multi-run benchmark.
 
 ---
 
 ## 📊 Evaluation
 
-All ASR experiments in this repository use the project's held-out validation set and the same WER evaluation pipeline unless otherwise specified.
+All ASR experiments in this repository use the project's own held-out validation set and the same WER evaluation pipeline unless otherwise specified.
 
-Results should be compared with external baselines only when their dataset split and evaluation methodology are known to be compatible. The BaltiVoice comparison shown below has **not been independently verified as an identical evaluation setup**, so the published result is included as an external reference point rather than a directly controlled comparison.
+The BaltiVoice comparison below has **not been independently verified as an identical evaluation setup** (dataset split and methodology compatibility are unconfirmed) — it's included as an external reference point, not a directly controlled comparison.
 
 For machine translation, BLEU is reported on the available Balti-English evaluation data.
 
 ---
 
-## 🏆 ASR Results — Balti Tarjuman
+## 🏆 ASR Results
 
-Our fine-tuned Whisper-small model currently achieves the **best WER observed in this project**, improving substantially over the published BaltiVoice Whisper-small baseline of **26.74%**.
-
-Results below were obtained across experiments conducted in this project. The published BaltiVoice result is included as an external reference point.
+Our fine-tuned Whisper-small model achieves the best WER observed in this project, improving substantially over the published BaltiVoice Whisper-small baseline of **26.74%**.
 
 |   Rank   | Model Architecture            | Strategy                         |   Steps  | Validation WER |                                    Link                                    |
-| :------: | :---------------------------- | :------------------------------- | :------: | :------------: | :------------------------------------------------------------------------: |
-| 🥇 **1** | **Whisper-small (Champion)**  | **Cold-Start + SpecAugment**     | **2500** |   **17.40%**   |     [HF Model](https://huggingface.co/YuvrajGujari/whisper-small-balti)    |
-| 🥈 **2** | Wav2Vec2 XLS-R 300M           | SpecAugment + Tuned LR           |   7560   |   **21.11%**   | [HF Model](https://huggingface.co/YuvrajGujari/wav2vec2-balti-specaugment) |
-| 🥉 **3** | *BaltiVoice Paper Baseline*   | Published Literature             |     —    |    *26.74%*    |                                      —                                     |
-|     4    | Wav2Vec2 XLS-R 300M           | Cold-Start CTC (no augmentation) |   7400   |   **22.82%**   |       [HF Model](https://huggingface.co/YuvrajGujari/wav2vec2-balti)       |
-|     5    | Whisper-small (Warm-Start R2) | Standard Fine-Tuning (`1e-5` LR) |   1000   |   **36.38%**   |                                      —                                     |
-|     6    | Whisper-small (Zero-Shot)     | Base Out-of-the-Box              |     0    |   **63.42%**   |                                      —                                     |
+| :------: | :----------------------------- | :-------------------------------- | :------: | :-------------: | :--------------------------------------------------------------------------: |
+| 🥇 **1** | **Whisper-small (Champion)**   | **Cold-Start + SpecAugment**      | **2500** |   **17.40%**    |     [HF Model](https://huggingface.co/YuvrajGujari/whisper-small-balti)     |
+| 🥈 **2** | Wav2Vec2 XLS-R 300M            | SpecAugment + Tuned LR            |   7560   |   **22.11%**    | [HF Model](https://huggingface.co/YuvrajGujari/wav2vec2-balti-specaugment) |
+| 🥉 **3** | *BaltiVoice Paper Baseline*    | Published Literature              |     —    |    *26.74%*     |                                      —                                      |
+|     4    | Wav2Vec2 XLS-R 300M            | Cold-Start CTC (no augmentation)  |   7400   |   **22.82%**    |       [HF Model](https://huggingface.co/YuvrajGujari/wav2vec2-balti)       |
+|     5    | Whisper-small (Warm-Start R2)  | Standard Fine-Tuning (`1e-5` LR)  |   1000   |   **36.38%**    |                                      —                                      |
+|     6    | Whisper-small (Zero-Shot)      | Base Out-of-the-Box               |     0    |   **63.42%**    |                                      —                                      |
 
 ---
 
@@ -105,20 +101,18 @@ The translation stage uses a fine-tuned **NLLB-200 distilled 600M** model adapte
 * **Evaluation metric:** BLEU
 * **BLEU:** **4.88**
 
-NLLB-200 did not natively provide Balti support for the required configuration, so the translation stage required model adaptation before fine-tuning. The project introduced the `bft_Arab` language token and initialized its embedding from a related existing language representation rather than leaving the new embedding randomly initialized.
-
-The resulting model is integrated directly into the end-to-end Balti → English pipeline.
+NLLB-200 did not natively support Balti, so the translation stage required model adaptation before fine-tuning: the project introduced the `bft_Arab` language token and initialized its embedding from a related existing language representation rather than random initialization.
 
 ---
 
 ## 🔗 Models & Datasets
 
 | Component           | Repository Link                                                                                             | Description                                                             |
-| :------------------ | :---------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------- |
-| 🏆 **ASR Champion** | [`YuvrajGujari/whisper-small-balti`](https://huggingface.co/YuvrajGujari/whisper-small-balti)               | Fine-tuned Whisper-small (**17.40% WER**)                               |
-| ⚡ **ASR Backup**    | [`YuvrajGujari/wav2vec2-balti-specaugment`](https://huggingface.co/YuvrajGujari/wav2vec2-balti-specaugment) | Fine-tuned Wav2Vec2 XLS-R 300M, SpecAugment + tuned LR (**21.11% WER**) |
-| 🌐 **MT Model**     | [`YuvrajGujari/nllb-balti-mt`](https://huggingface.co/YuvrajGujari/nllb-balti-mt)                           | Fine-tuned NLLB-200 Distilled (**4.88 BLEU**)                           |
-| 📂 **ASR Dataset**  | [`YuvrajGujari/balti-tarjuman-data`](https://huggingface.co/datasets/YuvrajGujari/balti-tarjuman-data)      | Cleaned Balti audio with Perso-Arabic text                              |
+| :------------------- | :------------------------------------------------------------------------------------------------------------ | :-------------------------------------------------------------------------- |
+| 🏆 **ASR Champion**  | [`YuvrajGujari/whisper-small-balti`](https://huggingface.co/YuvrajGujari/whisper-small-balti)               | Fine-tuned Whisper-small (**17.40% WER**)                                   |
+| ⚡ **ASR Fallback**   | [`YuvrajGujari/wav2vec2-balti-specaugment`](https://huggingface.co/YuvrajGujari/wav2vec2-balti-specaugment) | Fine-tuned Wav2Vec2 XLS-R 300M, SpecAugment + tuned LR (**22.11% WER**)      |
+| 🌐 **MT Model**      | [`YuvrajGujari/nllb-balti-mt`](https://huggingface.co/YuvrajGujari/nllb-balti-mt)                           | Fine-tuned NLLB-200 Distilled (**4.88 BLEU**)                               |
+| 📂 **ASR Dataset**   | [`YuvrajGujari/balti-tarjuman-data`](https://huggingface.co/datasets/YuvrajGujari/balti-tarjuman-data)      | Cleaned Balti audio with Perso-Arabic text                                  |
 
 ---
 
