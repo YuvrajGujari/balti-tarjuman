@@ -158,6 +158,27 @@ if result:
     print("English translation:", result["english_text"])
 ```
 
+### Live Demo (Gradio)
+
+```bash
+python gradio_streaming_demo.py
+```
+
+Launches a two-tab interface — live microphone streaming, and file
+upload — both running through the real `StreamingBaltiTarjumanPipeline`.
+
+### Testing the ASR Fallback
+
+```bash
+python scripts/test_asr_fallback.py
+```
+
+Pulls held-out clips from `YuvrajGujari/balti-tarjuman-data`, measures
+Whisper's real latency distribution, and deliberately exercises both
+the exception-based and timeout-based fallback paths to confirm they
+actually route to and return valid output from the wav2vec2 backup —
+not just that the code runs without error.
+
 ---
 
 ## 📖 Engineering Case Study
