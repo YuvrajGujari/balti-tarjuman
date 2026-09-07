@@ -183,7 +183,7 @@ not just that the code runs without error.
 
 ## 📖 Engineering Case Study
 
-For a detailed account of the challenges solved along the way — dataset acquisition, adapting NLLB for an unsupported language, ASR fine-tuning strategy, and building the real-time streaming layer — see [`docs/Engineering Case Study.md`](docs/Engineering%20Case%20Study.md).
+For a detailed account of the challenges solved along the way — dataset acquisition, adapting NLLB for an unsupported language, ASR fine-tuning strategy, and building the real-time streaming layer — see [`docs/Engineering Case Study.md`](Docs/Engineering%20Case%20Study.md).
 
 ---
 
